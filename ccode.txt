@@ -1,0 +1,705 @@
+import os
+import torch
+from torch.optim import AdamW
+from torch.utils.data import DataLoader
+from transformers import get_scheduler, AutoProcessor, Wav2Vec2FeatureExtractor
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from src.Florence2 import Florence2Classifier
+from src.florence2_wav import Florence2WavClassifier
+from src.MELD import MELD, collate_fn
+import functools
+from src.train import train_model
+import argparse
+import torchvision.transforms.v2 as v2
+
+transform = v2.RandomApply([
+    v2.RandomHorizontalFlip(p=1.0),
+    v2.RandomRotation(degrees=15),
+    v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+], p=0.5)
+
+# Load the processor
+MODEL_PATH="microsoft/Florence-2-large-ft"
+processor = AutoProcessor.from_pretrained(
+    MODEL_PATH,
+    # model_revision='refs/pr/6',
+    trust_remote_code=True,
+)
+
+wav_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained("facebook/wav2vec2-large-960h")
+
+LABEL_MAP = {'neutral': 0, 'surprise': 1, 'fear': 2, 'sadness': 3, 'joy': 4, 'disgust': 5, 'anger': 6}
+CLASS_WEIGHTS = {"neutral": 4.0, "surprise": 15.0, "fear": 15.0, "sadness": 3.0, "joy": 1.0, "disgust": 6.0, "anger": 3.0}
+ID_CLASS_WEIGHTS = {LABEL_MAP[k]: v for k, v in CLASS_WEIGHTS.items()}
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def main(args: argparse.Namespace) -> None:
+    # ✅ Initialize model
+    # model = Florence2Classifier()
+    # processor = model.processor
+    
+    # audio_model = Florence2WavClassifier() if args.include_audio else None
+    # audio_model.to(DEVICE) if audio_model else None
+    if args.include_audio:
+        print("Using Florence-2 with Wav2Vec2")
+        model = Florence2WavClassifier()
+        if args.frozen:
+            # model.wav_model.freeze_feature_extractor()  # Freeze the Wav2Vec2 feature extractor
+            print("Wav2Vec2 feature extractor (CNN) is frozen:")
+            for p in model.wav_model.feature_extractor.parameters():
+                p.requires_grad = False          # torch way
+                p.grad = None                    # save a bit of RAM
+            
+            for p in model.wav_model.feature_projection.parameters():
+                p.requires_grad = False
+                p.grad = None                    # save a bit of RAM
+
+            # 2) freeze the first N transformer blocks  (here N = 4)
+            N = 2
+            for idx, layer in enumerate(model.wav_model.encoder.layers):
+                if idx < N:                       # layers 0,1,2,3
+                    for p in layer.parameters():
+                        p.requires_grad = False
+    else:
+        print("Using Florence-2 without audio")
+        model = Florence2Classifier()        
+    
+    # freeze the DaViT backbone
+    if args.frozen:
+        print("Freezing the Florence-2 vision tower backbone")
+        for p in model.florence2.vision_tower.parameters():
+            p.requires_grad = False          # torch way
+            p.grad = None                    # save a bit of RAM
+            # p.is_trainable = False           # optional: mark for training scripts that honor .is_trainable
+        #below is for one time experiment, you can remove it later
+        # freeze stage 0 and 1, train stage 2-3
+        for stage_idx, (conv, block) in enumerate(
+                zip(model.florence2.vision_tower.convs, model.florence2.vision_tower.blocks)):
+            if stage_idx < 2:                       # change this split as you like
+                for p in conv.parameters():  p.requires_grad = False
+                for p in block.parameters(): p.requires_grad = False
+
+
+
+    # ✅ Wrap for multi-GPU training
+    if torch.cuda.device_count() > 1:
+        raise RuntimeError("Error: Multiple GPUs are detected, but this script does not support multi-GPU training yet.")
+
+
+    model.to(DEVICE)
+
+    # ✅ Hyperparameters
+    BATCH_SIZE = args.batch_size
+    EPOCHS = args.epochs
+    LR = args.lr
+
+    # ✅ Paths
+    logs_dir = args.log_dir + args.exp_name
+    os.makedirs(logs_dir, exist_ok=True)
+    output_dir = args.ckpt
+    os.makedirs(output_dir, exist_ok=True)
+    
+    if args.transform:
+        print("Using data augmentation transforms")
+    else:
+        print("No data augmentation transforms applied")
+        transform = None
+
+    # ✅ Datasets and loaders
+    train_dataset = MELD(args.data_train, transform=transform)
+    valid_dataset = MELD(args.data_val, transform=transform)
+    test_dataset = MELD(args.data_test, transform=transform)
+
+    meld_collate_fn = functools.partial(collate_fn, processor=processor, wav_feature_extractor=wav_feature_extractor)
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        collate_fn=meld_collate_fn,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+
+    valid_loader = DataLoader(
+        valid_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=meld_collate_fn,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=meld_collate_fn,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+
+    if args.weighted_loss:
+        print("Using weighted loss based on class distribution")
+        loss_fn = torch.nn.CrossEntropyLoss(weight=torch.tensor(list(ID_CLASS_WEIGHTS.values())).to(DEVICE))
+    else:
+        print("Using unweighted loss")
+        loss_fn = torch.nn.CrossEntropyLoss()
+    
+
+    # ✅ Train
+    avg_train_losses, avg_val_losses, acc_results, f1_results, wacc_results, wf1_results = train_model(
+        model=model,
+        processor=processor,
+        train_loader=train_loader,
+        val_loader=valid_loader,
+        test_loader=test_loader,
+        loss_fn=loss_fn,
+        device=DEVICE,
+        epochs=EPOCHS,
+        lr=LR,
+        tensorboard_logs=logs_dir,
+        output_dir=output_dir,        
+    )
+
+    print("\n✅ Training Completed")
+    print(f"📉 Avg. Train Losses: {avg_train_losses}")
+    print(f"📈 Avg. Val Losses: {avg_val_losses}")
+    print(f"✅ Acc Results: {acc_results}")
+    print(f"✅ F1 Results: {f1_results}")
+    print(f"✅ Weighted Acc Results: {wacc_results}")
+    print(f"✅ Weighted F1 Results: {wf1_results}")
+    
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Florence‑2 training")
+    parser.add_argument("--data_train", type=str, default="/data/shared/meld/meldraw/train_processed/")
+    parser.add_argument("--data_val", type=str, default="/data/shared/meld/meldraw/valid_processed/")
+    parser.add_argument("--data_test", type=str, default="/data/shared/meld/meldraw/test_processed/")
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--log_dir", type=str, default="tensorboard_logs/", help="Directory to save TensorBoard logs DONT CHANGE")
+    parser.add_argument("--exp_name", type=str, default="experiment_1", help="Name of the experiment")
+    parser.add_argument("--output_dir", type=str, default="./ckpt_")
+    parser.add_argument('--weighted_loss', action='store_true', help='whether to use weighted loss based on class distribution')
+    parser.add_argument('--ckpt', type=str, default='ckpt_', help='Path to save checkpoint')
+    parser.add_argument('--frozen', action='store_true', help='whether to freeze the backbone')
+    parser.add_argument('--transform', action='store_true', help='whether to apply data augmentation transforms')
+    parser.add_argument('--include_audio', action='store_true', help='whether to include audio features in the model')
+    args = parser.parse_args()
+
+    # Note: torchrun will provide env vars required by setup_ddp. We just run main.
+    main(args)
+import torch.nn as nn
+from transformers import AutoModelForCausalLM, AutoProcessor, Wav2Vec2FeatureExtractor, Wav2Vec2Model
+import torch
+from src.lib import create_mlp
+
+MODEL_PATH="microsoft/Florence-2-large-ft"
+
+class Florence2WavClassifier(nn.Module):
+    def __init__(self,
+                 pretrained_model_path=MODEL_PATH,
+                 model_revision='refs/pr/6',
+                 wav_pretrained_model_path="facebook/wav2vec2-large-960h",
+                 net_arch=[512, 256, 128, 64],  # MLP architecture
+                 activation_fn=nn.ReLU,
+                 num_labels=7):
+        super().__init__()
+
+        self.num_labels = num_labels
+        self.net_arch = net_arch
+        self.activation_fn = activation_fn
+
+        # Load Florence-2 base model
+        self.florence2 = AutoModelForCausalLM.from_pretrained(
+            pretrained_model_path,
+            output_attentions=False,
+            output_hidden_states=False,
+            trust_remote_code=True,
+            return_dict=True,
+        )
+
+        # Load the matching processor
+        self.processor = AutoProcessor.from_pretrained(
+            pretrained_model_path,
+            trust_remote_code=True,
+        )
+        
+        self.wav_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(wav_pretrained_model_path)
+        self.wav_model = Wav2Vec2Model.from_pretrained(wav_pretrained_model_path)
+
+        # (4) optional LayerNorm after concatenation
+        self.fuse_norm  = nn.LayerNorm(self.florence2.config.text_config.d_model)  # 
+
+        # Classification head
+        _mlp = create_mlp(self.florence2.config.text_config.d_model, 
+                        self.num_labels, 
+                        self.net_arch, 
+                        self.activation_fn, 
+                        post_linear_modules=[lambda _: nn.Dropout(p=0.1), nn.LayerNorm])
+        self.classifier = nn.Sequential(*_mlp)
+            
+
+    def forward(self, input_ids=None, pixel_values=None, attention_mask=None, decoder_input_ids=None, labels=None, audio_inputs=None):
+
+        # Florence-2 forward pass
+        outputs = self.florence2(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            attention_mask=attention_mask,
+            labels=labels, 
+            decoder_input_ids=torch.zeros_like(input_ids),  # Dummy decoder_input_ids required for causal LM
+            output_hidden_states=True,
+            return_dict=True
+        )
+        # both models output
+        audio_vec = self.wav_model(audio_inputs).last_hidden_state.mean(dim=1)
+        text_vec = outputs.encoder_last_hidden_state.mean(dim=1)
+
+
+        # (3) combine audio and text features
+        # fused = torch.cat([audio_vec, text_vec], dim=-1)  # concatination = (B, 2048)
+        fused = 0.9 * text_vec + 0.1 * audio_vec  # linear combination = (B, 1024)
+
+        # (4) global LayerNorm
+        fused_features = self.fuse_norm(fused)      
+        # (5) classification head  
+        logits = self.classifier(fused_features)
+        return {"logits": logits}
+
+
+
+wav_pretrained_model_path="facebook/wav2vec2-large-960h" 
+wav2vec_model = Wav2Vec2Model.from_pretrained(wav_pretrained_model_path,)
+wav2vec_modelimport torch
+import torch.nn as nn
+from typing import Optional
+
+# Function to run the model on an example
+def run_example(model, processor, task_prompt, text_input, image, device):
+    prompt = task_prompt + text_input
+
+    # Ensure the image is in RGB mode
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    inputs = processor(text=prompt, images=image, return_tensors="pt").to(device)
+    generated_ids = model.generate(
+        input_ids=inputs["input_ids"],
+        pixel_values=inputs["pixel_values"],
+        max_new_tokens=1024,
+        num_beams=3
+    )
+    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+    parsed_answer = processor.post_process_generation(generated_text, task=task_prompt, image_size=(image.width, image.height))
+    return parsed_answer
+
+
+# Given label mapping
+LABLE2ID = {
+    "neutral": 0,
+    "joy": 1,
+    "sadness": 2,
+    "anger": 3,
+    "surprise": 4,
+    "fear": 5,
+    "disgust": 6,
+}
+
+def emotion_one_hot_encode(target_labels, label_map=LABLE2ID, device='cpu'):
+    """
+    Converts a list of target labels into a one-hot encoded tensor.
+
+    Args:
+        target_labels (list of str): List of target emotion labels.
+        label_map (dict): Dictionary mapping labels to indices.
+        device (str): The device to place the tensor on (default: 'cuda:0').
+
+    Returns:
+        torch.Tensor: One-hot encoded tensor of shape (batch_size, num_classes).
+    """
+    target_indices = []
+    for label in target_labels:
+        assert label in label_map, f"Invalid label detected: {label}"
+        target_indices.append(label_map[label])
+
+    target_indices = torch.tensor(target_indices, device=device)
+    num_classes = len(label_map)
+
+    assert (target_indices >= 0).all() and (target_indices < num_classes).all(), "Label index out of bounds!"
+
+    one_hot_target = torch.nn.functional.one_hot(target_indices, num_classes=num_classes).float()
+
+    return one_hot_target
+
+def emotion_label_to_id(label_list, label_map=LABLE2ID): #TODO: need to be tested
+    """
+    Converts a list of emotion labels to their corresponding IDs.
+
+    Args:
+        label_list (list of str): List of emotion labels.
+        label_map (dict): Dictionary mapping labels to indices.
+
+    Returns:
+        list of int: List of emotion IDs corresponding to the labels.
+    """
+    return [label_map[label] for label in label_list if label in label_map]
+
+
+#coppied from https://github.com/DLR-RM/stable-baselines3/blob/master/stable_baselines3/common/torch_layers.py
+def create_mlp(
+    input_dim: int,
+    output_dim: int,
+    net_arch: list[int],
+    activation_fn: type[nn.Module] = nn.ReLU,
+    squash_output: bool = False,
+    with_bias: bool = True,
+    pre_linear_modules: Optional[list[type[nn.Module]]] = None,
+    post_linear_modules: Optional[list[type[nn.Module]]] = None,
+) -> list[nn.Module]:
+    """
+    Create a multi layer perceptron (MLP), which is
+    a collection of fully-connected layers each followed by an activation function.
+
+    :param input_dim: Dimension of the input vector
+    :param output_dim: Dimension of the output (last layer, for instance, the number of actions)
+    :param net_arch: Architecture of the neural net
+        It represents the number of units per layer.
+        The length of this list is the number of layers.
+    :param activation_fn: The activation function
+        to use after each layer.
+    :param squash_output: Whether to squash the output using a Tanh
+        activation function
+    :param with_bias: If set to False, the layers will not learn an additive bias
+    :param pre_linear_modules: List of nn.Module to add before the linear layers.
+        These modules should maintain the input tensor dimension (e.g. BatchNorm).
+        The number of input features is passed to the module's constructor.
+        Compared to post_linear_modules, they are used before the output layer (output_dim > 0).
+    :param post_linear_modules: List of nn.Module to add after the linear layers
+        (and before the activation function). These modules should maintain the input
+        tensor dimension (e.g. Dropout, LayerNorm). They are not used after the
+        output layer (output_dim > 0). The number of input features is passed to
+        the module's constructor.
+    :return: The list of layers of the neural network
+    """
+
+    pre_linear_modules = pre_linear_modules or []
+    post_linear_modules = post_linear_modules or []
+
+    modules = []
+    if len(net_arch) > 0:
+        # BatchNorm maintains input dim
+        for module in pre_linear_modules:
+            modules.append(module(input_dim))
+
+        modules.append(nn.Linear(input_dim, net_arch[0], bias=with_bias))
+
+        # LayerNorm, Dropout maintain output dim
+        for module in post_linear_modules:
+            modules.append(module(net_arch[0]))
+
+        modules.append(activation_fn())
+
+    for idx in range(len(net_arch) - 1):
+        for module in pre_linear_modules:
+            modules.append(module(net_arch[idx]))
+
+        modules.append(nn.Linear(net_arch[idx], net_arch[idx + 1], bias=with_bias))
+
+        for module in post_linear_modules:
+            modules.append(module(net_arch[idx + 1]))
+
+        modules.append(activation_fn())
+
+    if output_dim > 0:
+        last_layer_dim = net_arch[-1] if len(net_arch) > 0 else input_dim
+        # Only add BatchNorm before output layer
+        for module in pre_linear_modules:
+            modules.append(module(last_layer_dim))
+
+        modules.append(nn.Linear(last_layer_dim, output_dim, bias=with_bias))
+    if squash_output:
+        modules.append(nn.Tanh())
+    return modules
+import os
+import torch
+from tqdm import tqdm
+from .lib import emotion_one_hot_encode, emotion_label_to_id
+from torch.optim import AdamW
+from transformers import get_scheduler
+from sklearn.metrics import f1_score, accuracy_score
+from torch.utils.tensorboard import SummaryWriter
+from torch.nn.utils import clip_grad_norm_
+
+
+# LABEL_MAP = {"neutral": 0, "joy": 1, "sadness": 2, "anger": 3, "surprise": 4, "fear": 5, "disgust": 6} # this is inccorrect indexing
+LABEL_MAP = {'neutral': 0, 'surprise': 1, 'fear': 2, 'sadness': 3, 'joy': 4, 'disgust': 5, 'anger': 6}
+CLASS_WEIGHTS = {"neutral": 4.0, "surprise": 15.0, "fear": 15.0, "sadness": 3.0, "joy": 1.0, "disgust": 6.0, "anger": 3.0}
+
+ID_CLASS_WEIGHTS = {LABEL_MAP[k]: v for k, v in CLASS_WEIGHTS.items()}
+
+
+def evaluate_model(model, processor, test_loader, epoch, device=torch.device("cuda" if torch.cuda.is_available() else "cpu")):
+    model.eval()
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc=f"Testing Epoch {epoch + 1}"):
+            inputs, labels, audio_embed = batch
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            inputs["audio_inputs"] = audio_embed.to(device) if audio_embed is not None else None #TODO: review this step        
+            outputs = model(**inputs)
+            logits = torch.softmax(outputs["logits"], dim=1)
+            preds = torch.argmax(logits, dim=1)
+            # targets = torch.argmax(emotion_one_hot_encode(labels, label_map=LABEL_MAP, device=device), dim=1)
+            targets = emotion_label_to_id(labels, label_map=LABEL_MAP)
+
+
+            all_preds.extend(preds.cpu().tolist())
+            all_targets.extend(targets)
+        
+        
+        sample_weights = [ID_CLASS_WEIGHTS[int(t)] for t in all_targets]
+        
+        accuracy = accuracy_score(all_targets, all_preds)
+        weighted_accuracy = accuracy_score(all_targets, all_preds, sample_weight= sample_weights)
+        f1 = f1_score(all_targets, all_preds, average="macro", zero_division=0)
+        weighted_f1 = f1_score(all_targets, all_preds, sample_weight=sample_weights, average= "macro")
+        
+    return {
+        "accuracy": accuracy,
+        "weighted_accuracy": weighted_accuracy,
+        "f1_score": f1,
+        "weighted_f1_score": weighted_f1,
+    }
+
+
+
+def train_one_epoch(
+    model,
+    optimizer,
+    lr_scheduler,
+    train_loader,
+    val_loader,
+    epoch,
+    loss_fn=torch.nn.CrossEntropyLoss(),
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+):
+    train_loss = 0
+    model.train()
+
+    for batch in tqdm(train_loader, desc=f"Training Epoch {epoch + 1}"):
+        inputs, labels, audio_embed = batch
+
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        inputs["audio_inputs"] = audio_embed.to(device) if audio_embed is not None else None #TODO: review this step
+        target = emotion_one_hot_encode(labels, label_map=LABEL_MAP, device=device)
+
+        outputs = model(**inputs)
+            
+        logits = outputs["logits"]
+        
+        loss = loss_fn(logits, target)
+        loss.backward()
+        clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.zero_grad()
+
+        train_loss += loss.item()
+
+
+    val_loss = 0
+    model.eval()
+    with torch.no_grad():
+        for batch in tqdm(val_loader, desc=f"Validation Epoch {epoch + 1}"):
+            inputs, labels, audio_embed = batch
+
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            inputs["audio_inputs"] = audio_embed.to(device) if audio_embed is not None else None #TODO: review this step
+            
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            target = emotion_one_hot_encode(labels, device=device)
+
+            outputs = model(**inputs)
+            logits = outputs["logits"]
+
+            loss = loss_fn(logits, target)
+            val_loss += loss.item()
+
+    return train_loss, val_loss
+
+
+def train_model(
+    model,
+    processor,
+    train_loader,
+    val_loader,
+    test_loader,
+    loss_fn=torch.nn.CrossEntropyLoss(),
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    epochs=2,
+    lr=1e-6,
+    tensorboard_logs="tensorboard_logs",
+    output_dir="ckpt",
+):
+    if torch.cuda.device_count() > 1:
+        raise RuntimeError("Multiple GPUs are not supported yet. Please use a single GPU for training.")
+
+    model.to(device)
+
+    optimizer = AdamW((p for p in model.parameters() if p.requires_grad), lr=lr)
+    
+    # optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr,) #optimizer for frozen backbone
+    # optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    num_training_steps = epochs * len(train_loader)
+    # num_warmup_steps = int(0.1 * num_training_steps)
+    num_warmup_steps = 0  # No warmup steps, you can adjust this if needed
+    lr_scheduler = get_scheduler(
+        name="linear",
+        optimizer=optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps,
+    )
+
+    avg_train_losses = []
+    avg_val_losses = []
+    acc_results = []
+    f1_results = []
+    wacc_results = []
+    wf1_results = []
+
+
+    writer = SummaryWriter(log_dir=tensorboard_logs, flush_secs=240)
+    best_acc = 0.0
+    for epoch in range(epochs):
+        torch.cuda.empty_cache()
+
+        train_loss, val_loss = train_one_epoch(
+            model=model,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            epoch=epoch,
+            loss_fn=loss_fn,
+            device=device
+        )
+        
+        eval_results = evaluate_model(model, processor, test_loader, epoch, device=device)
+
+        avg_train_losses.append(train_loss / len(train_loader))
+        avg_val_losses.append(val_loss / len(val_loader))
+        acc_results.append(eval_results["accuracy"])
+        f1_results.append(eval_results["f1_score"])
+        wacc_results.append(eval_results["weighted_accuracy"])
+        wf1_results.append(eval_results["weighted_f1_score"])
+
+        writer.add_scalar("Loss/train", avg_train_losses[-1], epoch)
+        writer.add_scalar("Loss/val", avg_val_losses[-1], epoch)
+        writer.add_scalar("Accuracy/test", eval_results["accuracy"], epoch)
+        writer.add_scalar("F1/test", eval_results["f1_score"], epoch)   
+        writer.add_scalar("Weighted Accuracy/test", eval_results["weighted_accuracy"], epoch)
+        writer.add_scalar("Weighted F1/test", eval_results["weighted_f1_score"], epoch)
+        writer.add_scalar("Learning Rate", lr_scheduler.get_last_lr()[0], epoch)
+
+        print(f"Epoch {epoch + 1}/{epochs} - Accuracy: {eval_results['accuracy']:.4f}, Weighted Accuracy: {eval_results['weighted_accuracy']:.4f}")
+
+        if acc_results[-1] >= best_acc:
+            best_acc = acc_results[-1]
+            model_to_save = model.module if isinstance(model, torch.nn.DataParallel) else model
+            ckpt_path = os.path.join(output_dir, f"model_epoch_{epoch+1}_ACC_{acc_results[-1]:.4f}.pt")
+            torch.save(model_to_save.state_dict(), ckpt_path)
+            # processor_path = os.path.join(output_dir, f"processor_epoch_{epoch+1}_ValLoss_{val_loss:.4f}")
+            processor_path = os.path.join(output_dir, f"processor_epoch_{epoch+1}_ACC_{acc_results[-1]:.4f}")
+            processor.save_pretrained(processor_path)
+
+    return avg_train_losses, avg_val_losses, acc_results, f1_results, wacc_results, wf1_results
+import os
+import json
+import torch
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from natsort import natsorted
+from transformers import AutoProcessor, Wav2Vec2FeatureExtractor
+import torchvision.transforms.v2 as T
+import soundfile as sf
+
+# ✅ Step 1: Define Image Transformations
+transform = T.Compose([
+    T.ToImage(),
+    T.Resize((224, 224)),
+    T.ToDtype(torch.float32),
+])
+
+# ✅ Step 2: Load Processor Once
+processor = AutoProcessor.from_pretrained(
+    "microsoft/Florence-2-base-ft",
+    trust_remote_code=True,
+    revision='refs/pr/6'
+)
+wav_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained("facebook/wav2vec2-large-960h")
+
+# ✅ Step 3: MELD Dataset (Utterance-Level Batching)
+class MELD(Dataset):
+    def __init__(self, folder_path, transform=None):
+        self.utterances = []
+        self.transform = transform
+
+        # Collect all JSON files
+        all_json_files = [
+            os.path.join(root, file_name)
+            for root, _, files in os.walk(folder_path)
+            for file_name in files if file_name.endswith("_paired_data.json")
+        ]
+        all_json_files = natsorted(all_json_files)
+
+        # Load utterances
+        for file_path in all_json_files:
+            with open(file_path, 'r') as f:
+                utterances = json.load(f)
+                self.utterances.extend(utterances)
+
+    def __len__(self):
+        return len(self.utterances)
+
+    def __getitem__(self, idx):
+        utterance = self.utterances[idx]
+
+        if utterance["emotion"] not in ["neutral", "joy", "sadness", "anger", "surprise", "fear", "disgust"]:
+            raise ValueError(f"Invalid emotion '{utterance['emotion']}' in utterance {idx}. Expected one of ['neutral', 'joy', 'sadness', 'anger', 'surprise', 'fear', 'disgust'].")
+
+        image_path = os.path.normpath(utterance["image"]).replace("\\", "/")
+        # image_path = os.path.join(os.path.dirname("/data/shared/meld/meldraw/"), image_path)
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+        
+        audio_path = os.path.normpath(utterance["audio"]).replace("\\", "/")
+        waveform, sampling_rate = sf.read(audio_path, dtype='float32', always_2d=True)
+        mono = waveform.mean(axis=1)
+        
+
+        image = Image.open(image_path).convert("RGB")
+        return image, utterance["text"], utterance["emotion"], mono
+
+
+# ✅ Step 4: Optimized collate_fn
+def collate_fn(batch, processor=processor, wav_feature_extractor=wav_feature_extractor):
+    # Remove None values (for missing samples)
+    batch = [b for b in batch if b is not None]
+
+    if len(batch) == 0:
+        raise ValueError("Batch is empty after filtering. Ensure valid data is provided.")
+
+    images, texts, emotions, audio = zip(*batch)
+    inputs = processor(text=texts, images=images, return_tensors="pt", padding=True, do_rescale=True)
+    audio_inputs = wav_feature_extractor(audio, padding=True, return_tensors="pt", sampling_rate=16000)['input_values']
+
+
+    return inputs, emotions, audio_inputs
