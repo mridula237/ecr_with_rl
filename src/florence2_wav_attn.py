@@ -101,11 +101,12 @@ class Florence2WavAttnClassifier(nn.Module):
         
         # Classification head
         self.mlp = MLP(
-            input_dim=self.florence2.config.text_config.d_model,
-            hidden_dims=self.net_arch,
-            output_dim=self.num_labels,
-            activation_fn=self.activation_fn
-        )
+    input_dim=self.florence2.config.text_config.d_model * 2,  # 2048
+    hidden_dims=self.net_arch,
+    output_dim=self.num_labels,
+    activation_fn=self.activation_fn
+)
+
         
 
     def forward(self, input_ids=None, pixel_values=None, attention_mask=None, decoder_input_ids=None, labels=None, audio_inputs=None):

@@ -2,6 +2,7 @@ import os
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from transformers import get_scheduler, AutoProcessor, Wav2Vec2FeatureExtractor
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -14,6 +15,11 @@ import functools
 from src.train import train_model
 import argparse
 import torchvision.transforms.v2 as v2
+
+# === NEW: DDP imports (minimal) ===
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+# ===================================
 
 transform = v2.RandomApply([
     v2.RandomHorizontalFlip(p=1.0),
@@ -42,6 +48,19 @@ def main(args: argparse.Namespace) -> None:
     if not args.freeze_backbone and args.unfreeze_on_epoch is not None:
         raise ValueError("If --unfreeze_on_epoch is set, you must also specify --freeze_backbone.")
 
+    # === NEW: DDP init (minimal; before model/device/path logic) ===
+    multi_gpu = torch.cuda.device_count() > 1 and "LOCAL_RANK" in os.environ
+    if multi_gpu:
+        dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        print(f"✅ Using distributed training on GPU {local_rank}")
+    else:
+        local_rank = 0
+        device = DEVICE
+    # ===============================================================
+
     # audio_model = Florence2WavClassifier() if args.include_audio else None
     # audio_model.to(DEVICE) if audio_model else None
     if args.use_cross_attn:
@@ -54,14 +73,14 @@ def main(args: argparse.Namespace) -> None:
         model = Florence2WavAttnClassifier()
     else:
         print("Using Florence-2 without audio")
-        model = Florence2Classifier(device=DEVICE)        
-    
+        model = Florence2Classifier(device=device)        
+
     # freeze the DaViT backbone
     if args.freeze_backbone:
         print("Freezing the Florence-2 vision tower backbone")
         for p in model.florence2.vision_tower.parameters():
-            p.requires_grad = False          # torch way
-            p.grad = None                    # save a bit of RAM
+            p.requires_grad = False
+            p.grad = None
         
         if args.freeze_encoder > 0:
             print(f"Freezing first {args.freeze_encoder} encoder layers of Florence-2 language model")
@@ -70,12 +89,11 @@ def main(args: argparse.Namespace) -> None:
                     for param in layer.parameters():
                         param.requires_grad = False
         
-            
         if args.include_audio:
             print(f"freezing Wav2Vec Feature Extractor model")
             for p in model.wav_model.feature_extractor.parameters():
                 p.requires_grad = False
-                p.grad = None  # save a bit of RAM
+                p.grad = None
             
             if args.freeze_encoder > 0:
                 print(f"freezing first {args.freeze_encoder} Wav2Vec2 transformer blocks")
@@ -84,25 +102,26 @@ def main(args: argparse.Namespace) -> None:
                         for p in layer.parameters():
                             p.requires_grad = False
 
-
-    # ✅ Wrap for multi-GPU training
-    if torch.cuda.device_count() > 1:
-        raise RuntimeError("Error: Multiple GPUs are detected, but this script does not support multi-GPU training yet.")
-
-
-    model.to(DEVICE)
+    # ✅ Wrap for multi-GPU training (keeps your original intent; minimal change)
+    model.to(device)
+    if multi_gpu:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
     # ✅ Hyperparameters
     BATCH_SIZE = args.batch_size
     EPOCHS = args.epochs
     LR = args.lr
 
-    # ✅ Paths
+    # ✅ Paths (only rank 0 writes)
     logs_dir = args.log_dir + args.exp_name
-    os.makedirs(logs_dir, exist_ok=True)
     output_dir = args.ckpt
-    os.makedirs(output_dir, exist_ok=True)
-    
+    if (not multi_gpu) or (multi_gpu and local_rank == 0):
+        os.makedirs(logs_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
+    else:
+        logs_dir = None
+        output_dir = None
+
     if args.transform:
         print("Using data augmentation transforms")
     else:
@@ -123,12 +142,22 @@ def main(args: argparse.Namespace) -> None:
         test_dataset = IEMOCAP(args.data_test, transform=transform)
         _collate_fn = functools.partial(collate_fn_iemocap, processor=processor, wav_feature_extractor=wav_feature_extractor)   
     else:
-        raise ValueError(f"Unsupported dataset: {args.dataset}. Supported datasets are 'MELD' and 'IEMOCAP'.")        
-    
+        raise ValueError(f"Unsupported dataset: {args.dataset}. Supported datasets are 'MELD' and 'IEMOCAP'.")
+
+    # === NEW: Distributed samplers (minimal) ===
+    if multi_gpu:
+        train_sampler = DistributedSampler(train_dataset, shuffle=True)
+        valid_sampler = DistributedSampler(valid_dataset, shuffle=False)
+        test_sampler  = DistributedSampler(test_dataset,  shuffle=False)
+    else:
+        train_sampler = valid_sampler = test_sampler = None
+    # ===========================================
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         collate_fn=_collate_fn,
         num_workers=args.num_workers,
         pin_memory=True
@@ -138,14 +167,17 @@ def main(args: argparse.Namespace) -> None:
         valid_dataset,
         batch_size=args.batch_size,
         shuffle=False,
+        sampler=valid_sampler,
         collate_fn=_collate_fn,
         num_workers=args.num_workers,
         pin_memory=True
     )
+
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
         shuffle=False,
+        sampler=test_sampler,
         collate_fn=_collate_fn,
         num_workers=args.num_workers,
         pin_memory=True
@@ -153,13 +185,11 @@ def main(args: argparse.Namespace) -> None:
 
     if args.weighted_loss:
         print("Using weighted loss based on class distribution")
-        # Ensure the weight tensor matches the number of classes
         assert len(ID_CLASS_WEIGHTS) == len(LABEL_MAP), "Mismatch between class weights and number of classes in LABEL_MAP"
-        loss_fn = torch.nn.CrossEntropyLoss(weight=torch.tensor([ID_CLASS_WEIGHTS[i] for i in range(len(LABEL_MAP))]).to(DEVICE))
+        loss_fn = torch.nn.CrossEntropyLoss(weight=torch.tensor([ID_CLASS_WEIGHTS[i] for i in range(len(LABEL_MAP))]).to(device))
     else:
         print("Using unweighted loss")
         loss_fn = torch.nn.CrossEntropyLoss()
-    
 
     # ✅ Train
     avg_train_losses, avg_val_losses, acc_results, f1_results, wacc_results, wf1_results = train_model(
@@ -169,7 +199,7 @@ def main(args: argparse.Namespace) -> None:
         val_loader=valid_loader,
         test_loader=test_loader,
         loss_fn=loss_fn,
-        device=DEVICE,
+        device=device,
         epochs=EPOCHS,
         lr=LR,
         tensorboard_logs=logs_dir,
@@ -177,6 +207,11 @@ def main(args: argparse.Namespace) -> None:
         include_audio=args.include_audio,      
         unfreeze_on_epoch=args.unfreeze_on_epoch, 
     )
+
+    # === NEW: clean up DDP ===
+    if multi_gpu:
+        dist.destroy_process_group()
+    # =========================
 
     print("\n✅ Training Completed")
     print(f"📉 Avg. Train Losses: {avg_train_losses}")
@@ -188,13 +223,13 @@ def main(args: argparse.Namespace) -> None:
     
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Florence‑2 training")
-    parser.add_argument("--data_train", type=str, default="/data/shared/meld/meld_modified/meld_updated/train_processed/")
-    parser.add_argument("--data_val", type=str, default="/data/shared/meld/meld_modified/meld_updated/valid_processed/")
-    parser.add_argument("--data_test", type=str, default="/data/shared/meld/meld_modified/meld_updated/test_processed/")
-    # parser.add_argument("--data_train", type=str, default="/data/shared/meld_dataset/meldraw/train/processed_videos")
-    # parser.add_argument("--data_val", type=str, default="/data/shared/meld_dataset/meldraw/dev/processed_videos_valid")
-    # parser.add_argument("--data_test", type=str, default="/data/shared/meld_dataset/meldraw/test/processed_videos_test")
+    parser = argparse.ArgumentParser(description="Florence-2 training")
+    # parser.add_argument("--data_train", type=str, default="/data/shared/meld/meld_modified/meld_updated/train_processed/")
+    # parser.add_argument("--data_val", type=str, default="/data/shared/meld/meld_modified/meld_updated/valid_processed/")
+    # parser.add_argument("--data_test", type=str, default="/data/shared/meld/meld_modified/meld_updated/test_processed/")
+    parser.add_argument("--data_train", type=str, default="/data/shared/meld_dataset/meldraw/train/processed_videos")
+    parser.add_argument("--data_val", type=str, default="/data/shared/meld_dataset/meldraw/dev/processed_videos_valid")
+    parser.add_argument("--data_test", type=str, default="/data/shared/meld_dataset/meldraw/test/processed_videos_test")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-5)
