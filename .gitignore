@@ -210,3 +210,6 @@ __marimo__/
 
 ckpt_/
 tensorboard_logs/meld_train_mridula
+
+Florence2large/pytorch_model.bin
+Florence2large/pytorch_model.bin?download=true
